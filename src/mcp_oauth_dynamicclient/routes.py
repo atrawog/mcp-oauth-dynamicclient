@@ -90,9 +90,9 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
             "response_types_supported": ["code"],
             "subject_types_supported": ["public"],
             "id_token_signing_alg_values_supported": ["HS256", "RS256"],
-            "scopes_supported": ["openid", "profile", "email"],
+            "scopes_supported": ["openid", "profile", "email", "mcp:read", "mcp:write", "mcp:session"],
             "token_endpoint_auth_methods_supported": ["client_secret_post", "client_secret_basic"],
-            "claims_supported": ["sub", "name", "email", "preferred_username"],
+            "claims_supported": ["sub", "name", "email", "preferred_username", "aud", "azp"],
             "code_challenge_methods_supported": ["S256"],
             "grant_types_supported": ["authorization_code", "refresh_token"],
             "revocation_endpoint": f"{base_url}/revoke",
@@ -100,6 +100,18 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
             "service_documentation": f"{base_url}/docs",
             "op_policy_uri": f"{base_url}/policy",
             "op_tos_uri": f"{base_url}/terms",
+            # RFC 8707 Resource Indicators
+            "resource_indicators_supported": True,
+            "resource_parameter_supported": True,
+            "authorization_response_iss_parameter_supported": True,
+            # MCP-specific metadata
+            "mcp_protocol_version": settings.mcp_protocol_version,
+            "mcp_compliance": {
+                "resource_indicators": "RFC 8707",
+                "protected_resource_metadata": "RFC 9728",
+                "audience_validation": True,
+                "resource_specific_tokens": True
+            }
         }
 
     # JWKS endpoint for RS256 public key distribution
@@ -227,6 +239,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
         state: str = Query(...),
         code_challenge: Optional[str] = Query(None),
         code_challenge_method: Optional[str] = Query("S256"),
+        resource: Optional[list[str]] = Query(None),  # RFC 8707 Resource Indicators
         redis_client: redis.Redis = Depends(get_redis),
     ):
         """Portal to authentication realm - initiates GitHub OAuth flow"""
@@ -317,6 +330,16 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                 },
             )
 
+        # Validate resource parameters (RFC 8707)
+        if resource:
+            # Ensure all resources are valid URIs
+            for res in resource:
+                if not res.startswith(("http://", "https://")):
+                    return RedirectResponse(
+                        url=f"{redirect_uri}?error=invalid_resource&error_description=Resource+must+be+a+valid+URI&state={state}",
+                    )
+            logger.info(f"Authorization request includes resources: {resource}")
+
         # Store authorization request state
         auth_state = secrets.token_urlsafe(32)
         auth_data = {
@@ -326,6 +349,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
             "state": state,
             "code_challenge": code_challenge,
             "code_challenge_method": code_challenge_method,
+            "resources": resource if resource else [],  # RFC 8707 Resource Indicators
         }
 
         await redis_client.setex(
@@ -463,6 +487,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
         client_secret: Optional[str] = Form(None),
         code_verifier: Optional[str] = Form(None),
         refresh_token: Optional[str] = Form(None),
+        resource: Optional[list[str]] = Form(None),  # RFC 8707 Resource Indicators
         redis_client: redis.Redis = Depends(get_redis),
     ):
         """The transmutation chamber - exchanges codes for tokens"""
@@ -553,6 +578,27 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                         },
                     )
 
+            # Validate resource parameters (RFC 8707)
+            authorized_resources = code_data.get("resources", [])
+            requested_resources = resource if resource else []
+            
+            # If resources were requested at token endpoint, ensure they were authorized
+            if requested_resources:
+                for res in requested_resources:
+                    if res not in authorized_resources:
+                        raise HTTPException(
+                            status_code=400,
+                            detail={
+                                "error": "invalid_target",
+                                "error_description": f"Resource '{res}' was not authorized",
+                            },
+                        )
+                # Use only the requested subset of authorized resources
+                token_resources = requested_resources
+            else:
+                # Use all authorized resources if none specifically requested
+                token_resources = authorized_resources
+
             # Generate tokens
             access_token = await auth_manager.create_jwt_token(
                 {
@@ -562,6 +608,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                     "name": code_data["name"],
                     "scope": code_data["scope"],
                     "client_id": client_id,
+                    "resources": token_resources,  # RFC 8707 Resource Indicators
                 },
                 redis_client,
             )
@@ -572,6 +619,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                     "username": code_data["username"],
                     "client_id": client_id,
                     "scope": code_data["scope"],
+                    "resources": token_resources,  # RFC 8707 Resource Indicators
                 },
                 redis_client,
             )
@@ -609,6 +657,23 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
 
             refresh_data = json.loads(refresh_data_str)
 
+            # Validate resource parameters if provided (RFC 8707)
+            if resource:
+                authorized_resources = refresh_data.get("resources", [])
+                for res in resource:
+                    if res not in authorized_resources:
+                        raise HTTPException(
+                            status_code=400,
+                            detail={
+                                "error": "invalid_target",
+                                "error_description": f"Resource '{res}' was not authorized",
+                            },
+                        )
+                token_resources = resource
+            else:
+                # Use all resources from refresh token
+                token_resources = refresh_data.get("resources", [])
+
             # Generate new access token
             access_token = await auth_manager.create_jwt_token(
                 {
@@ -616,6 +681,7 @@ def create_oauth_router(settings: Settings, redis_manager, auth_manager: AuthMan
                     "username": refresh_data["username"],
                     "scope": refresh_data["scope"],
                     "client_id": client_id,
+                    "resources": token_resources,  # RFC 8707 Resource Indicators
                 },
                 redis_client,
             )

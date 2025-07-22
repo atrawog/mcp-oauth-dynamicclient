@@ -24,23 +24,49 @@ class AsyncResourceProtector:
         self.key_manager = key_manager
         self.validator = JWTBearerTokenValidator(settings, redis_client, key_manager)
 
-    async def validate_request(self, request: Request) -> Optional[dict[str, Any]]:
+    async def validate_request(self, request: Request, resource: Optional[str] = None) -> Optional[dict[str, Any]]:
         """Validate the request and extract token information.
 
         Args:
             request: FastAPI Request object
+            resource: Optional resource URI for audience validation
 
         Returns:
             Token claims if valid, raises HTTPException if invalid
 
         """
+        # Build WWW-Authenticate header with metadata URLs (RFC 9728)
+        auth_server_url = f"https://auth.{self.settings.base_domain}"
+        
+        # If resource is provided, construct resource metadata URL
+        if resource:
+            # Parse resource URL to get host
+            from urllib.parse import urlparse
+            parsed = urlparse(resource)
+            resource_host = parsed.netloc or parsed.path
+            resource_metadata_url = f"{resource}/.well-known/oauth-protected-resource"
+        else:
+            # Use request host as resource
+            host = request.headers.get("host", "localhost")
+            proto = request.headers.get("x-forwarded-proto", "https")
+            resource = f"{proto}://{host}"
+            resource_metadata_url = f"{resource}/.well-known/oauth-protected-resource"
+        
+        www_auth_params = [
+            'Bearer',
+            f'realm="MCP Server"',
+            f'as_uri="{auth_server_url}/.well-known/oauth-authorization-server"',
+            f'resource_uri="{resource_metadata_url}"'
+        ]
+        www_authenticate = ", ".join(www_auth_params)
+        
         # Check if request is valid
         error = self.validator.request_invalid(request)
         if error:
             raise HTTPException(
                 status_code=401,
                 detail={"error": "invalid_request", "error_description": error},
-                headers={"WWW-Authenticate": "Bearer"},
+                headers={"WWW-Authenticate": www_authenticate},
             )
 
         # Extract token from Authorization header
@@ -52,7 +78,7 @@ class AsyncResourceProtector:
                     "error": "invalid_request",
                     "error_description": "Authorization header must use Bearer scheme",
                 },
-                headers={"WWW-Authenticate": "Bearer"},
+                headers={"WWW-Authenticate": www_authenticate},
             )
 
         token_string = auth_header[7:]  # Remove "Bearer " prefix
@@ -61,14 +87,35 @@ class AsyncResourceProtector:
         token_data = await self.validator.authenticate_token(token_string)
 
         if not token_data:
+            # Add error parameter to WWW-Authenticate
+            www_auth_error = www_authenticate.replace('Bearer', 'Bearer error="invalid_token"')
             raise HTTPException(
                 status_code=401,
                 detail={
                     "error": "invalid_token",
                     "error_description": "The access token is invalid or expired",
                 },
-                headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+                headers={"WWW-Authenticate": www_auth_error},
             )
+
+        # Validate audience if resource is specified
+        if resource and token_data:
+            aud = token_data.get("aud", [])
+            # Normalize audience to list
+            if isinstance(aud, str):
+                aud = [aud]
+            
+            # Check if resource is in audience
+            if resource not in aud:
+                www_auth_error = www_authenticate.replace('Bearer', 'Bearer error="invalid_audience"')
+                raise HTTPException(
+                    status_code=403,
+                    detail={
+                        "error": "invalid_audience",
+                        "error_description": f"Token is not valid for resource: {resource}",
+                    },
+                    headers={"WWW-Authenticate": www_auth_error},
+                )
 
         return token_data
 

@@ -93,13 +93,24 @@ class AuthManager:
         # Prepare JWT claims according to RFC 7519
         now = datetime.now(timezone.utc)
         header = {"alg": self.settings.jwt_algorithm}
+        
+        # Handle audience claim for RFC 8707 Resource Indicators
+        resources = claims.pop("resources", [])
+        if resources:
+            # If resources specified, use them as audience (RFC 8707)
+            aud = resources if len(resources) > 1 else resources[0]
+        else:
+            # Fallback to auth server URL for backward compatibility
+            aud = f"https://auth.{self.settings.base_domain}"
+        
         payload = {
             **claims,
             "jti": jti,
             "iat": int(now.timestamp()),
             "exp": int((now + timedelta(seconds=self.settings.access_token_lifetime)).timestamp()),
             "iss": f"https://auth.{self.settings.base_domain}",
-            "aud": f"https://auth.{self.settings.base_domain}",
+            "aud": aud,
+            "azp": claims.get("client_id"),  # Authorized party claim
         }
 
         # Create token using Authlib with the BLESSED RS256 algorithm!

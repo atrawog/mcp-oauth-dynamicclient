@@ -19,7 +19,7 @@ class RSAKeyManager:
     def load_or_generate_keys(self):
         """Load RSA keys from environment variables or generate new ones"""
         # Try to load from environment variables first (preferred method)
-        jwt_private_key_b64 = os.getenv("JWT_PRIVATE_KEY_B64")
+        jwt_private_key_b64 = os.getenv("OAUTH_JWT_PRIVATE_KEY_B64")
 
         if jwt_private_key_b64:
             # Load from environment variable (base64 encoded)
@@ -38,7 +38,7 @@ class RSAKeyManager:
                 return
             except Exception as e:
                 raise ValueError(
-                    f"Failed to load RSA private key from JWT_PRIVATE_KEY_B64: {e}",
+                    f"Failed to load RSA private key from OAUTH_JWT_PRIVATE_KEY_B64: {e}",
                 ) from e
 
         # Fallback: Try to load from files (legacy support)
@@ -65,8 +65,8 @@ class RSAKeyManager:
 
         # If no keys found, raise an error instead of generating
         raise ValueError(
-            "No RSA keys found! Please run 'just generate-rsa-keys' to create JWT_PRIVATE_KEY_B64 "
-            "in your .env file, or provide JWT_PRIVATE_KEY_B64 environment variable.",
+            "No RSA keys found! Please run 'just generate-oauth-key' to create OAUTH_JWT_PRIVATE_KEY_B64 "
+            "in your .env file, or provide OAUTH_JWT_PRIVATE_KEY_B64 environment variable.",
         )
 
     def get_jwk(self):
